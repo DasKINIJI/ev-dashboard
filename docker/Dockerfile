@@ -3,6 +3,8 @@
 # Base images are pinned by digest through Renovate (pinDigests).
 ARG NODE_BUILD_IMAGE=cgr.dev/chainguard/node:latest-dev
 ARG RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base:latest
+# Wolfi no longer maintains a public caddy package, so Caddy is built from source with a current Go.
+ARG GO_IMAGE=docker.io/library/golang:1.27-alpine
 
 # ---- build: install dependencies and build the SvelteKit app ----
 FROM ${NODE_BUILD_IMAGE} AS build
@@ -17,6 +19,23 @@ COPY apps/web/package.json apps/web/
 RUN pnpm install --frozen-lockfile
 COPY apps/web apps/web
 RUN pnpm --filter @ev-dashboard/web build
+
+# ---- caddy: build from source ----
+# Building ourselves keeps the Go toolchain and golang.org/x/* patched,
+# instead of waiting for an upstream Caddy release.
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS caddy
+ARG TARGETOS TARGETARCH
+# renovate: datasource=github-releases depName=caddyserver/caddy
+ARG CADDY_VERSION=2.11.7
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-mod=mod
+WORKDIR /caddy
+COPY docker/caddy/main.go ./
+# golang.org/x/* float to @latest on purpose so every build picks up their security fixes.
+# hadolint ignore=DL3062
+RUN go mod init caddy \
+	&& go get github.com/caddyserver/caddy/v2@v${CADDY_VERSION} golang.org/x/net@latest golang.org/x/crypto@latest golang.org/x/text@latest \
+	&& go mod tidy \
+	&& GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w" -o /out/caddy .
 
 # ---- s6: fetch and verify s6-overlay ----
 FROM ${RUNTIME_IMAGE} AS s6
@@ -52,13 +71,14 @@ LABEL org.opencontainers.image.title="EV Dashboard" \
 	org.opencontainers.image.version="${APP_VERSION}"
 
 # hadolint ignore=DL3018
-RUN apk add --no-cache nodejs-22 caddy \
+RUN apk add --no-cache nodejs-22 \
 	&& addgroup -g 10001 app \
 	&& adduser -D -H -u 10001 -G app -s /sbin/nologin app \
 	&& mkdir -p /app /data /run \
 	&& chown app:app /data /run
 
 COPY --from=s6 /s6root/ /
+COPY --from=caddy /out/caddy /usr/bin/caddy
 COPY docker/rootfs/ /
 COPY --from=build --chown=app:app /src/apps/web/build /app/build
 COPY --from=build --chown=app:app /src/apps/web/package.json /app/package.json
