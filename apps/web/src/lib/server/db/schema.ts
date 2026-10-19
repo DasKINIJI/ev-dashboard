@@ -2,7 +2,15 @@
 // (field names must match); the vehicle tables below belong to the app.
 // After changing this file run `pnpm --filter @ev-dashboard/web db:generate`.
 import { sql } from 'drizzle-orm';
-import { index, integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import {
+	blob,
+	index,
+	integer,
+	real,
+	sqliteTable,
+	text,
+	uniqueIndex
+} from 'drizzle-orm/sqlite-core';
 
 const now = sql`(cast(unixepoch('subsecond') * 1000 as integer))`;
 
@@ -174,4 +182,58 @@ export const snapshot = sqliteTable(
 		index('snapshot_connection_fetched_idx').on(t.connectionId, t.fetchedAt),
 		index('snapshot_fetched_at_idx').on(t.fetchedAt)
 	]
+);
+
+/**
+ * Trip log: finished trips copied from the snapshot series, so they outlive the snapshot
+ * retention, plus what the owner records about them (private or business, purpose).
+ */
+export const trip = sqliteTable(
+	'trip',
+	{
+		id: text('id').primaryKey(),
+		connectionId: text('connection_id')
+			.notNull()
+			.references(() => vehicleConnection.id, { onDelete: 'cascade' }),
+		/** Last snapshot before departure; identifies the trip within its connection. */
+		startAt: integer('start_at', { mode: 'timestamp_ms' }).notNull(),
+		endAt: integer('end_at', { mode: 'timestamp_ms' }).notNull(),
+		distanceKm: real('distance_km').notNull(),
+		startOdometerKm: real('start_odometer_km'),
+		endOdometerKm: real('end_odometer_km'),
+		startSocPct: real('start_soc_pct'),
+		endSocPct: real('end_soc_pct'),
+		startLatitude: real('start_latitude'),
+		startLongitude: real('start_longitude'),
+		endLatitude: real('end_latitude'),
+		endLongitude: real('end_longitude'),
+		startAddress: text('start_address'),
+		endAddress: text('end_address'),
+		/** Snapshots were missing during the trip, so its timing is uncertain. */
+		gap: integer('gap', { mode: 'boolean' }).notNull().default(false),
+		/** `private` or `business`; null until the owner classifies the trip. */
+		purpose: text('purpose'),
+		/** Free text, e.g. the customer or the reason for a business trip. */
+		note: text('note'),
+		createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().default(now),
+		updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().default(now)
+	},
+	(t) => [uniqueIndex('trip_connection_start_idx').on(t.connectionId, t.startAt)]
+);
+
+/** Excel templates an owner uploaded to fill from the trip log (see export/templates.ts). */
+export const exportTemplate = sqliteTable(
+	'export_template',
+	{
+		id: text('id').primaryKey(),
+		userId: text('user_id')
+			.notNull()
+			.references(() => user.id, { onDelete: 'cascade' }),
+		name: text('name').notNull(),
+		/** Detected layout, e.g. `annual-mileage`. */
+		kind: text('kind').notNull(),
+		data: blob('data', { mode: 'buffer' }).notNull(),
+		createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().default(now)
+	},
+	(t) => [index('export_template_user_idx').on(t.userId)]
 );

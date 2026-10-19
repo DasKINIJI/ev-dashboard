@@ -5,9 +5,11 @@ import * as env from '$app/env/private';
 import { createAuth, OIDC_PROVIDER_ID, type Auth, type AuthSettings } from './auth/config.ts';
 import { deriveKey } from './crypto.ts';
 import { openDatabase, type Database } from './db/index.ts';
+import { createTemplateStore, type TemplateStore } from './export/templates.ts';
 import { createGeocoder, type Geocoder } from './geocode.ts';
 import { createProviders } from './providers/index.ts';
 import { loadOrCreateSecret } from './secrets.ts';
+import { createLogbook, type Logbook } from './vehicles/logbook.ts';
 import { createPoller, type Poller } from './vehicles/poller.ts';
 import { createVehicleService, type VehicleService } from './vehicles/service.ts';
 import type { LoginMethods } from '../auth-shared.ts';
@@ -18,6 +20,8 @@ type App = {
 	encryptionKey: Buffer;
 	methods: LoginMethods;
 	vehicles: VehicleService;
+	logbook: Logbook;
+	templates: TemplateStore;
 	/** Absent when GEOCODING_ENABLED is false. */
 	geocoder?: Geocoder;
 };
@@ -57,17 +61,21 @@ function create(): App {
 		loadOrCreateSecret(dataDir, 'encryption-key', env.ENCRYPTION_KEY)
 	);
 
+	const vehicles = createVehicleService({
+		db,
+		key: encryptionKey,
+		providers: createProviders(),
+		appUrl: env.APP_URL,
+		pollIntervalMs: env.POLL_INTERVAL_SECONDS * 1000
+	});
+
 	return {
 		db,
 		auth: createAuth(settings, db),
 		encryptionKey,
-		vehicles: createVehicleService({
-			db,
-			key: encryptionKey,
-			providers: createProviders(),
-			appUrl: env.APP_URL,
-			pollIntervalMs: env.POLL_INTERVAL_SECONDS * 1000
-		}),
+		vehicles,
+		logbook: createLogbook({ db, maxGapMs: vehicles.staleAfterMs }),
+		templates: createTemplateStore(db),
 		geocoder: env.GEOCODING_ENABLED
 			? createGeocoder({
 					baseUrl: env.GEOCODING_URL,
@@ -100,17 +108,19 @@ type PollerGlobal = typeof globalThis & { [POLLER_KEY]?: Poller };
 export function startVehiclePoller() {
 	const g = globalThis as PollerGlobal;
 	if (g[POLLER_KEY]) return;
-	const { vehicles } = getApp();
+	const { vehicles, logbook } = getApp();
 	let lastPrune = 0;
 	const poller = createPoller({
 		periodMs: POLLER_PERIOD_MS,
 		initialDelayMs: 5_000,
 		tick: async () => {
+			await vehicles.pollDue();
+			// Finished trips are copied into the trip log before pruning can remove them.
+			await logbook.recordAll();
 			if (Date.now() - lastPrune >= PRUNE_EVERY_MS) {
 				lastPrune = Date.now();
 				await vehicles.prune(env.RETENTION_DAYS);
 			}
-			await vehicles.pollDue();
 		},
 		onError: (error) => console.error('[vehicles] poller run failed:', (error as Error)?.name)
 	});
