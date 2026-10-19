@@ -2,7 +2,7 @@
 // with per-connection backoff, snapshots and retention. All user-facing functions take the
 // user ID and only ever touch that user's rows.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { and, asc, count, desc, eq, isNull, lt, lte, ne, or } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import { decrypt, encrypt } from '../crypto.ts';
 import type { Database } from '../db/index.ts';
 import { providerOAuthState, snapshot, vehicleConnection } from '../db/schema.ts';
@@ -17,6 +17,7 @@ import {
 	type VehicleProvider
 } from '../providers/types.ts';
 import { getVehicleApiCredentials } from '../vehicle-api.ts';
+import type { HistoryPoint } from './charging.ts';
 
 /** Pending authorizations expire after this. */
 export const STATE_TTL_MS = 10 * 60 * 1000;
@@ -28,6 +29,8 @@ export const MAX_BACKOFF_MS = 6 * 3600 * 1000;
 export const MANUAL_FETCH_MIN_GAP_MS = 60 * 1000;
 /** How many snapshots with stored raw responses are searched for the latest one per endpoint. */
 const RAW_LOOKBACK = 50;
+/** Upper bound for one history query; 90 days at the default 5 min interval are ~26k rows. */
+const HISTORY_MAX_ROWS = 50_000;
 
 /** Makes untrusted text safe for a single log line. */
 const clean = (text: string) => text.replace(/[^\x20-\x7e]/g, '?').slice(0, 300);
@@ -44,6 +47,8 @@ export type ConnectionView = {
 	lastError: ProviderErrorCode | null;
 	createdAt: Date;
 	snapshotCount: number;
+	/** Usable battery capacity in kWh, when the owner entered it. */
+	batteryCapacityKwh: number | null;
 };
 
 export type SnapshotView = { fetchedAt: Date; data: VehicleData; raw: RawResponses };
@@ -251,6 +256,7 @@ export function createVehicleService(options: VehicleServiceOptions) {
 			label: row.label,
 			status: row.status === 'reauth' ? 'reauth' : 'active',
 			lastSuccessAt: row.lastSuccessAt,
+			batteryCapacityKwh: row.batteryCapacityKwh,
 			lastErrorAt: row.lastErrorAt,
 			lastError: ERROR_CODES.includes(row.lastError as ProviderErrorCode)
 				? (row.lastError as ProviderErrorCode)
@@ -519,6 +525,16 @@ export function createVehicleService(options: VehicleServiceOptions) {
 		return pollConnection(id);
 	}
 
+	/** Stores the usable battery capacity (kWh), or clears it with `null`. */
+	async function setBatteryCapacity(userId: string, id: string, kwh: number | null) {
+		if (!(await ownedConnection(userId, id))) return false;
+		await db
+			.update(vehicleConnection)
+			.set({ batteryCapacityKwh: kwh, updatedAt: new Date(now()) })
+			.where(and(eq(vehicleConnection.id, id), eq(vehicleConnection.userId, userId)));
+		return true;
+	}
+
 	/** Deletes the connection, its tokens and (by cascade) its snapshots. */
 	async function disconnect(userId: string, id: string): Promise<boolean> {
 		if (!(await ownedConnection(userId, id))) return false;
@@ -526,6 +542,32 @@ export function createVehicleService(options: VehicleServiceOptions) {
 			.delete(vehicleConnection)
 			.where(and(eq(vehicleConnection.id, id), eq(vehicleConnection.userId, userId)));
 		return true;
+	}
+
+	/** Normalized values since `since`, oldest first (bounded), for charts and sessions. */
+	async function history(
+		userId: string,
+		id: string,
+		since: Date,
+		until?: Date
+	): Promise<HistoryPoint[]> {
+		if (!(await ownedConnection(userId, id))) return [];
+		const rows = await db
+			.select({ fetchedAt: snapshot.fetchedAt, data: snapshot.data })
+			.from(snapshot)
+			.where(
+				and(
+					eq(snapshot.connectionId, id),
+					gte(snapshot.fetchedAt, since),
+					until ? lte(snapshot.fetchedAt, until) : undefined
+				)
+			)
+			// Newest first so a cut keeps the recent end, then back to chronological order.
+			.orderBy(desc(snapshot.fetchedAt))
+			.limit(HISTORY_MAX_ROWS);
+		return rows
+			.reverse()
+			.map((row) => ({ at: row.fetchedAt, data: parseJson<VehicleData>(row.data, {}) }));
 	}
 
 	/** Removes snapshots older than `retentionDays` (0 = keep) and expired OAuth states. */
@@ -546,10 +588,14 @@ export function createVehicleService(options: VehicleServiceOptions) {
 		getConnection,
 		latestSnapshot,
 		latestValues,
+		history,
+		/** Values older than this count as stale; also the largest gap within a session. */
+		staleAfterMs: Math.max(3 * pollIntervalMs, 30 * 60 * 1000),
 		pollConnection,
 		pollDue,
 		fetchNow,
 		disconnect,
+		setBatteryCapacity,
 		prune,
 		/** Aborts outstanding provider requests (shutdown). */
 		stop: () => abort.abort()
